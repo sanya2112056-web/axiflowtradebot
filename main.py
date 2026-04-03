@@ -1,34 +1,30 @@
 """
-AXIFLOW TRADE v3 — Pure Smart Money Engine
-NO indicators. Only market structure:
-  - Liquidity Sweeps
-  - Fair Value Gap (FVG)
-  - Order Blocks
-  - CVD Divergence
-  - Funding Rate extremes
-  - Open Interest delta
-  - Liquidation clusters
-  - Orderbook imbalance
-  - AMD pattern
-Timeframes: 5m confirmation + 1h structure
+AXIFLOW TRADE v4 — Pure Smart Money Engine
+Rules:
+- NO classic indicators (RSI MACD EMA etc)
+- 4 pillars x 25pts = 100: Derivatives + OrderFlow + Liquidity + Structure
+- Signal only if confidence >= 70%
+- Max 1 signal per symbol per 15 minutes
+- No flat market trading
+- No low volume trading
+- Alts priority (more volatile moves)
+- Fixed: latin-1 encoding error on API keys
 """
-import asyncio, os, time, logging, math
+import asyncio, os, time, logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
 from pydantic import BaseModel
+import httpx
 
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+    from dotenv import load_dotenv; load_dotenv()
+except: pass
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("axiflow")
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -36,49 +32,79 @@ TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 PORT     = int(os.environ.get("PORT", 3000))
 BFUT     = "https://fapi.binance.com"
 
+# Alts first — more moves
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-    "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT",
-    "LTCUSDT","MATICUSDT","ATOMUSDT","NEARUSDT","APTUSDT",
-    "ARBUSDT","OPUSDT","INJUSDT","SUIUSDT","TIAUSDT",
+    "SOLUSDT","AVAXUSDT","NEARUSDT","INJUSDT","APTUSDT",
+    "ARBUSDT","OPUSDT","SUIUSDT","TIAUSDT","DOTUSDT",
+    "LINKUSDT","ATOMUSDT","ADAUSDT","MATICUSDT","LTCUSDT",
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
 ]
+
+SIGNAL_COOLDOWN = 900   # 15 min cooldown per symbol
+MIN_CONFIDENCE  = 70    # minimum confidence to fire signal
+
+_last_signal: dict = {}  # sym -> timestamp
+cache: dict = {}
+wallets: dict = {}
+manual_trades: list = []
 
 
 # ══════════════════════════════════════════
-#  SIGNAL
+#  SIGNAL MODEL
 # ══════════════════════════════════════════
 @dataclass
 class Signal:
     symbol:     str
-    decision:   str
-    confidence: int
+    decision:   str    # LONG / SHORT / NO TRADE
+    confidence: int    # 0-100
     strategy:   str
     entry:      float
-    tp:         float
+    tp1:        float
+    tp2:        float
+    tp3:        float
     sl:         float
     rr:         float
     move_pct:   float
     lev:        int
     reasons:    list
-    structure:  dict   # raw market structure data
+    raw:        dict
     ts:         float = field(default_factory=time.time)
 
     def to_dict(self):
         return {
-            "symbol":    self.symbol,
-            "decision":  self.decision,
-            "confidence":self.confidence,
-            "strategy":  self.strategy,
-            "entry":     self.entry,
-            "tp":        round(self.tp, 6),
-            "sl":        round(self.sl, 6),
-            "rr":        round(self.rr, 2),
-            "move_pct":  round(self.move_pct, 2),
-            "lev":       self.lev,
-            "reasons":   self.reasons,
-            "raw":       self.structure,
-            "ts":        self.ts,
+            "symbol":     self.symbol,
+            "decision":   self.decision,
+            "confidence": self.confidence,
+            "strategy":   self.strategy,
+            "entry":      self.entry,
+            "tp":         round(self.tp1, 8),
+            "tp1":        round(self.tp1, 8),
+            "tp2":        round(self.tp2, 8),
+            "tp3":        round(self.tp3, 8),
+            "sl":         round(self.sl, 8),
+            "rr":         round(self.rr, 2),
+            "move_pct":   round(self.move_pct, 2),
+            "lev":        self.lev,
+            "reasons":    self.reasons,
+            "raw":        self.raw,
+            "ts":         self.ts,
         }
+
+
+def no_trade(sym, price, oi_d=0, fr=0, liq_r=1, ob_i=0, reason="No signal"):
+    return {
+        "symbol": sym, "decision": "NO TRADE", "confidence": 0,
+        "strategy": "STANDARD", "entry": price,
+        "tp": price, "tp1": price, "tp2": price, "tp3": price,
+        "sl": price, "rr": 0, "move_pct": 0, "lev": 1,
+        "reasons": [reason],
+        "raw": {
+            "price": price, "change": 0, "oi_15m": oi_d,
+            "funding": fr, "liq_ratio": liq_r, "ob_imb": ob_i,
+            "conf_long": 0, "conf_short": 0, "structure": "unknown",
+        },
+        "ts": time.time(),
+    }
 
 
 # ══════════════════════════════════════════
@@ -86,7 +112,7 @@ class Signal:
 # ══════════════════════════════════════════
 async def _get(url, params=None):
     try:
-        async with httpx.AsyncClient(timeout=8) as c:
+        async with httpx.AsyncClient(timeout=9) as c:
             r = await c.get(url, params=params)
             r.raise_for_status()
             return r.json()
@@ -110,22 +136,24 @@ async def get_ticker(sym):
     }
 
 async def get_klines(sym, tf="5m", limit=150):
-    d = await _get(f"{BFUT}/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": limit})
+    d = await _get(f"{BFUT}/fapi/v1/klines",
+                   {"symbol": sym, "interval": tf, "limit": limit})
     if not d: return []
-    return [{"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),
-             "c":float(x[4]),"v":float(x[5]),"t":int(x[0])} for x in d]
+    return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]),
+             "c": float(x[4]), "v": float(x[5]), "t": int(x[0])} for x in d]
 
 async def get_oi(sym):
     now  = await _get(f"{BFUT}/fapi/v1/openInterest", {"symbol": sym})
     hist = await _get(f"{BFUT}/futures/data/openInterestHist",
-                      {"symbol": sym, "period": "5m", "limit": 24})
-    if not now: return {"delta_15m": 0, "delta_1h": 0, "delta_4h": 0,
-                        "strength": 0, "current": 0, "trend": "flat"}
+                      {"symbol": sym, "period": "5m", "limit": 36})
+    if not now:
+        return {"delta_15m": 0, "delta_1h": 0, "delta_4h": 0, "strength": 0,
+                "current": 0, "trend": "flat"}
     cur  = float(now["openInterest"])
     vals = [float(h["sumOpenInterest"]) for h in (hist or [])]
     p15  = vals[-3]  if len(vals) >= 3  else cur
     p1h  = vals[-12] if len(vals) >= 12 else cur
-    p4h  = vals[-24] if len(vals) >= 24 else cur
+    p4h  = vals[-36] if len(vals) >= 36 else cur
     d15  = (cur - p15) / max(p15, 1) * 100
     d1h  = (cur - p1h) / max(p1h, 1) * 100
     d4h  = (cur - p4h) / max(p4h, 1) * 100
@@ -135,267 +163,197 @@ async def get_oi(sym):
             "trend": trend}
 
 async def get_funding(sym):
-    d = await _get(f"{BFUT}/fapi/v1/premiumIndex", {"symbol": sym})
+    d  = await _get(f"{BFUT}/fapi/v1/premiumIndex", {"symbol": sym})
     fr = float(d["lastFundingRate"]) if d else 0
-    return {"rate": fr, "extreme_long": fr > 0.01, "extreme_short": fr < -0.01,
-            "bullish": fr < -0.005, "bearish": fr > 0.005}
+    return {
+        "rate":          fr,
+        "extreme_long":  fr >  0.01,
+        "extreme_short": fr < -0.01,
+        "bullish":       fr < -0.005,
+        "bearish":       fr >  0.005,
+    }
 
 async def get_liqs(sym):
     d = await _get(f"{BFUT}/fapi/v1/allForceOrders", {"symbol": sym, "limit": 500})
-    if not d: return {"ratio": 1.0, "long_vol": 0, "short_vol": 0,
-                      "strength": 0, "total": 0, "dominant": "none"}
+    if not d:
+        return {"ratio": 1.0, "long_vol": 0, "short_vol": 0, "strength": 0, "total": 0}
     lv = sum(float(o["origQty"]) * float(o["price"]) for o in d if o.get("side") == "SELL")
     sv = sum(float(o["origQty"]) * float(o["price"]) for o in d if o.get("side") == "BUY")
-    total = lv + sv
-    r = lv / max(sv, 1)
-    dominant = "longs" if r > 2 else "shorts" if r < 0.5 else "balanced"
-    return {"ratio": r, "long_vol": lv, "short_vol": sv, "total": total,
-            "strength": 2 if r > 3 or r < 0.33 else 1 if r > 2 or r < 0.5 else 0,
-            "dominant": dominant}
+    r  = lv / max(sv, 1)
+    return {
+        "ratio": r, "long_vol": lv, "short_vol": sv, "total": lv + sv,
+        "strength": 2 if r > 3 or r < 0.33 else 1 if r > 2 or r < 0.5 else 0,
+    }
 
-async def get_ob(sym, depth=100):
-    d = await _get(f"{BFUT}/fapi/v1/depth", {"symbol": sym, "limit": depth})
-    if not d: return {"imbalance": 0, "strength": 0, "bid_wall": 0, "ask_wall": 0}
-    bids = d.get("bids", [])
-    asks = d.get("asks", [])
-    bv = sum(float(b[1]) for b in bids)
-    av = sum(float(a[1]) for a in asks)
+async def get_ob(sym):
+    d = await _get(f"{BFUT}/fapi/v1/depth", {"symbol": sym, "limit": 100})
+    if not d: return {"imbalance": 0, "strength": 0}
+    bv = sum(float(b[1]) for b in d.get("bids", []))
+    av = sum(float(a[1]) for a in d.get("asks", []))
     total = bv + av
     imb = (bv - av) / total if total else 0
-    # Find walls (large orders)
-    bid_wall = max((float(b[1]) for b in bids), default=0)
-    ask_wall = max((float(a[1]) for a in asks), default=0)
     return {"bid": bv, "ask": av, "imbalance": imb,
-            "strength": 2 if abs(imb) > 0.2 else 1 if abs(imb) > 0.1 else 0,
-            "bid_wall": bid_wall, "ask_wall": ask_wall}
+            "strength": 2 if abs(imb) > 0.2 else 1 if abs(imb) > 0.1 else 0}
 
-
-# ══════════════════════════════════════════
-#  SMART MONEY STRUCTURE ANALYSIS
-# ══════════════════════════════════════════
-
-def detect_fvg(candles, lookback=30):
-    """
-    Fair Value Gap — imbalance between candles.
-    FVG UP: candle[i].low > candle[i-2].high
-    FVG DOWN: candle[i].high < candle[i-2].low
-    Returns most recent FVGs within price range
-    """
-    fvgs = []
-    data = candles[-lookback:]
-    for i in range(2, len(data)):
-        c0 = data[i-2]; c2 = data[i]
-        # Bullish FVG
-        if c2["l"] > c0["h"]:
-            fvgs.append({
-                "type": "bullish",
-                "top":  c2["l"],
-                "bot":  c0["h"],
-                "mid":  (c2["l"] + c0["h"]) / 2,
-                "size": (c2["l"] - c0["h"]) / c0["h"] * 100,
-                "idx":  i,
-            })
-        # Bearish FVG
-        elif c2["h"] < c0["l"]:
-            fvgs.append({
-                "type": "bearish",
-                "top":  c0["l"],
-                "bot":  c2["h"],
-                "mid":  (c0["l"] + c2["h"]) / 2,
-                "size": (c0["l"] - c2["h"]) / c0["l"] * 100,
-                "idx":  i,
-            })
-    # Return only significant FVGs (size > 0.1%)
-    sig = [f for f in fvgs if f["size"] > 0.1]
-    return sig[-5:] if sig else []
-
-
-def detect_order_blocks(candles, lookback=50):
-    """
-    Order Block — last bearish candle before strong bullish move (bull OB)
-    or last bullish candle before strong bearish move (bear OB)
-    """
-    obs = []
-    data = candles[-lookback:]
-    avg_size = sum(abs(c["c"] - c["o"]) for c in data) / max(len(data), 1)
-
-    for i in range(1, len(data) - 2):
-        c = data[i]
-        next_c = data[i + 1]
-        body = abs(c["c"] - c["o"])
-        next_body = abs(next_c["c"] - next_c["o"])
-
-        # Bull OB: bearish candle followed by strong bullish move
-        if c["c"] < c["o"] and next_c["c"] > next_c["o"] and next_body > avg_size * 1.5:
-            obs.append({
-                "type":  "bullish",
-                "top":   c["o"],
-                "bot":   c["c"],
-                "mid":   (c["o"] + c["c"]) / 2,
-                "idx":   i,
-            })
-        # Bear OB: bullish candle followed by strong bearish move
-        elif c["c"] > c["o"] and next_c["c"] < next_c["o"] and next_body > avg_size * 1.5:
-            obs.append({
-                "type":  "bearish",
-                "top":   c["c"],
-                "bot":   c["o"],
-                "mid":   (c["c"] + c["o"]) / 2,
-                "idx":   i,
-            })
-    return obs[-5:] if obs else []
-
-
-def detect_liquidity_sweep(candles, lookback=50):
-    """
-    Liquidity Sweep — price breaks recent high/low then reverses back.
-    = stop hunt / wick that took out liquidity
-    """
-    data = candles[-lookback:]
-    if len(data) < 10: return {"bull_sweep": False, "bear_sweep": False}
-
-    recent = data[:-3]
-    last3  = data[-3:]
-
-    prev_high = max(c["h"] for c in recent)
-    prev_low  = min(c["l"] for c in recent)
-
-    last_high = max(c["h"] for c in last3)
-    last_low  = min(c["l"] for c in last3)
-    last_close = data[-1]["c"]
-
-    # Bull sweep: swept below prev low but closed back above
-    bull_sweep = last_low < prev_low and last_close > prev_low
-
-    # Bear sweep: swept above prev high but closed back below
-    bear_sweep = last_high > prev_high and last_close < prev_high
-
-    sweep_pct_bull = (prev_low - last_low) / prev_low * 100 if bull_sweep else 0
-    sweep_pct_bear = (last_high - prev_high) / prev_high * 100 if bear_sweep else 0
-
+async def get_ls(sym):
+    d = await _get(f"{BFUT}/futures/data/globalLongShortAccountRatio",
+                   {"symbol": sym, "period": "5m", "limit": 3})
+    if not d: return {"ratio": 1.0, "long_pct": 50, "short_pct": 50}
+    last = d[-1]
     return {
-        "bull_sweep":      bull_sweep,
-        "bear_sweep":      bear_sweep,
-        "sweep_pct_bull":  sweep_pct_bull,
-        "sweep_pct_bear":  sweep_pct_bear,
-        "prev_high":       prev_high,
-        "prev_low":        prev_low,
+        "ratio":     float(last.get("longShortRatio", 1)),
+        "long_pct":  float(last.get("longAccount", 0.5)) * 100,
+        "short_pct": float(last.get("shortAccount", 0.5)) * 100,
     }
 
 
-def detect_cvd_divergence(candles):
-    """
-    CVD (Cumulative Volume Delta) divergence:
-    Price going up but CVD going down = bearish
-    Price going down but CVD going up = bullish
-    Also detects absorption (large volume at key level with no price move)
-    """
-    if len(candles) < 20: return {"divergence": 0, "absorption": False}
+# ══════════════════════════════════════════
+#  SMART MONEY DETECTORS
+# ══════════════════════════════════════════
+def detect_market_structure(candles):
+    """HH/HL = uptrend  |  LH/LL = downtrend  |  else = range"""
+    if len(candles) < 20: return {"phase": "range", "trend": "flat"}
+    data = candles[-30:]
+    ph, pl = [], []
+    for i in range(2, len(data) - 2):
+        if data[i]["h"] > data[i-1]["h"] and data[i]["h"] > data[i+1]["h"]:
+            ph.append(data[i]["h"])
+        if data[i]["l"] < data[i-1]["l"] and data[i]["l"] < data[i+1]["l"]:
+            pl.append(data[i]["l"])
+    if len(ph) >= 2 and len(pl) >= 2:
+        if ph[-1] > ph[-2] and pl[-1] > pl[-2]: return {"phase": "uptrend",   "trend": "up"}
+        if ph[-1] < ph[-2] and pl[-1] < pl[-2]: return {"phase": "downtrend", "trend": "down"}
+    return {"phase": "range", "trend": "flat"}
 
-    # Compute CVD
+def detect_market_phase(candles, oi_delta):
+    """accumulation / manipulation / distribution / expansion"""
+    if len(candles) < 20: return "unknown"
+    recent = candles[-20:]
+    vols   = [c["v"] for c in recent]
+    rng    = (max(c["h"] for c in recent) - min(c["l"] for c in recent))
+    rng_pct = rng / max(min(c["l"] for c in recent), 1) * 100
+    avg_vol = sum(vols) / len(vols)
+    vol_declining = vols[-1] < avg_vol * 0.7
+    if rng_pct < 2.0 and vol_declining and abs(oi_delta) < 3:
+        return "accumulation"
+    if rng_pct > 4.0:
+        return "distribution" if candles[-1]["c"] < candles[-5]["c"] else "expansion"
+    return "consolidation"
+
+def detect_flat(candles):
+    """True if market is flat/chop — don't trade"""
+    if len(candles) < 15: return True
+    data = candles[-15:]
+    rng  = (max(c["h"] for c in data) - min(c["l"] for c in data))
+    rng_pct = rng / max(min(c["l"] for c in data), 1) * 100
+    return rng_pct < 1.0
+
+def detect_fvg(candles, lb=60):
+    """Fair Value Gaps — price imbalances between candles"""
+    fvgs = []
+    data = candles[-lb:]
+    for i in range(2, len(data)):
+        c0 = data[i-2]; c2 = data[i]
+        if c2["l"] > c0["h"]:   # bullish FVG
+            sz = (c2["l"] - c0["h"]) / max(c0["h"], 1) * 100
+            if sz > 0.06:
+                fvgs.append({"type": "bullish", "top": c2["l"], "bot": c0["h"],
+                             "mid": (c2["l"] + c0["h"]) / 2, "size": sz})
+        elif c2["h"] < c0["l"]:  # bearish FVG
+            sz = (c0["l"] - c2["h"]) / max(c0["l"], 1) * 100
+            if sz > 0.06:
+                fvgs.append({"type": "bearish", "top": c0["l"], "bot": c2["h"],
+                             "mid": (c0["l"] + c2["h"]) / 2, "size": sz})
+    return fvgs[-6:] if fvgs else []
+
+def detect_obs(candles, lb=100):
+    """Order Blocks — last candle before strong move"""
+    obs  = []
+    data = candles[-lb:]
+    avg  = sum(abs(c["c"] - c["o"]) for c in data) / max(len(data), 1)
+    for i in range(1, len(data) - 2):
+        c = data[i]; n = data[i+1]
+        nb = abs(n["c"] - n["o"])
+        if c["c"] < c["o"] and n["c"] > n["o"] and nb > avg * 1.5:
+            obs.append({"type": "bullish", "top": c["o"], "bot": c["c"],
+                        "mid": (c["o"] + c["c"]) / 2})
+        elif c["c"] > c["o"] and n["c"] < n["o"] and nb > avg * 1.5:
+            obs.append({"type": "bearish", "top": c["c"], "bot": c["o"],
+                        "mid": (c["c"] + c["o"]) / 2})
+    return obs[-6:] if obs else []
+
+def detect_sweep(candles, lb=60):
+    """Liquidity Sweep — price takes stops then reverses"""
+    data = candles[-lb:]
+    if len(data) < 10: return {"bull_sweep": False, "bear_sweep": False}
+    recent = data[:-4]; last4 = data[-4:]
+    ph = max(c["h"] for c in recent)
+    pl = min(c["l"] for c in recent)
+    lh = max(c["h"] for c in last4)
+    ll = min(c["l"] for c in last4)
+    lc = data[-1]["c"]
+    bs = ll < pl and lc > pl
+    be = lh > ph and lc < ph
+    return {
+        "bull_sweep":      bool(bs),
+        "bear_sweep":      bool(be),
+        "sweep_pct_bull":  (pl - ll) / max(pl, 1) * 100 if bs else 0,
+        "sweep_pct_bear":  (lh - ph) / max(ph, 1) * 100 if be else 0,
+        "prev_high":       ph,
+        "prev_low":        pl,
+    }
+
+def detect_cvd(candles):
+    """CVD divergence + absorption detection"""
+    if len(candles) < 20:
+        return {"divergence": 0, "absorption": False, "buying_pressure": 50}
     cvd_vals = []
     cum = 0.0
     for c in candles:
-        delta = c["v"] if c["c"] >= c["o"] else -c["v"]
-        cum += delta
+        cum += c["v"] if c["c"] >= c["o"] else -c["v"]
         cvd_vals.append(cum)
-
-    # Compare recent price trend vs CVD trend
-    period = 10
-    price_start = candles[-period]["c"]
-    price_end   = candles[-1]["c"]
-    cvd_start   = cvd_vals[-period]
-    cvd_end     = cvd_vals[-1]
-
-    price_up = price_end > price_start * 1.001
-    price_dn = price_end < price_start * 0.999
-    cvd_up   = cvd_end > cvd_start * 1.001 if cvd_start != 0 else cvd_end > cvd_start
-    cvd_dn   = cvd_end < cvd_start * 0.999 if cvd_start != 0 else cvd_end < cvd_start
-
-    divergence = 0
-    if price_up and cvd_dn: divergence = -1  # bearish divergence
-    if price_dn and cvd_up: divergence = 1   # bullish divergence
-
-    # Absorption: big volume but small candle body (smart money absorbing)
-    last = candles[-1]
-    avg_vol  = sum(c["v"] for c in candles[-20:]) / 20
-    avg_body = sum(abs(c["c"] - c["o"]) for c in candles[-20:]) / 20
-    body_now = abs(last["c"] - last["o"])
-    absorption = last["v"] > avg_vol * 2 and body_now < avg_body * 0.5
-
+    period = 12
+    p_start = candles[-period]["c"]; p_end = candles[-1]["c"]
+    cvd_s   = cvd_vals[-period];     cvd_e = cvd_vals[-1]
+    price_up = p_end > p_start * 1.001
+    price_dn = p_end < p_start * 0.999
+    cvd_up   = cvd_e > cvd_s
+    cvd_dn   = cvd_e < cvd_s
+    div = 0
+    if price_up and cvd_dn: div = -1   # bearish divergence
+    if price_dn and cvd_up: div =  1   # bullish divergence
+    # Absorption
+    last    = candles[-1]
+    avg_v   = sum(c["v"] for c in candles[-20:]) / 20
+    avg_b   = sum(abs(c["c"] - c["o"]) for c in candles[-20:]) / 20
+    absorb  = last["v"] > avg_v * 2.0 and abs(last["c"] - last["o"]) < avg_b * 0.4
+    # Buy pressure
+    bv = sum(c["v"] for c in candles[-10:] if c["c"] >= c["o"])
+    sv = sum(c["v"] for c in candles[-10:] if c["c"] <  c["o"])
+    bp = bv / (bv + sv) * 100 if (bv + sv) > 0 else 50
     return {
-        "divergence":  divergence,
-        "absorption":  absorption,
-        "cvd_current": cvd_end,
-        "cvd_trend":   "rising" if cvd_up else "falling" if cvd_dn else "flat",
-        "price_trend": "rising" if price_up else "falling" if price_dn else "flat",
+        "divergence":      div,
+        "absorption":      bool(absorb),
+        "buying_pressure": bp,
+        "cvd_trend":       "rising" if cvd_up else "falling" if cvd_dn else "flat",
     }
-
 
 def detect_liq_clusters(candles):
-    """
-    Liquidation clusters — zones with many stops.
-    Equal highs/lows = stop cluster (liquidity pool).
-    """
-    if len(candles) < 30: return {"clusters_above": [], "clusters_below": []}
-    tol = 0.002  # 0.2% tolerance
-
-    highs = [c["h"] for c in candles[-50:]]
-    lows  = [c["l"] for c in candles[-50:]]
-
-    # Find equal highs (stops above)
-    clusters_above = []
-    for i, h in enumerate(highs):
-        similar = [hh for hh in highs[i+1:] if abs(hh - h) / h < tol]
-        if len(similar) >= 2:
-            clusters_above.append(round(h, 4))
-
-    # Find equal lows (stops below)
-    clusters_below = []
-    for i, l in enumerate(lows):
-        similar = [ll for ll in lows[i+1:] if abs(ll - l) / l < tol]
-        if len(similar) >= 2:
-            clusters_below.append(round(l, 4))
-
-    return {
-        "clusters_above": list(set(clusters_above))[:3],
-        "clusters_below": list(set(clusters_below))[:3],
-    }
-
-
-def detect_amd(candles_5m, oi_delta):
-    """AMD — Accumulation / Manipulation / Distribution"""
-    if len(candles_5m) < 20: return {"confirmed": False}
-    recent = candles_5m[-20:]
-    highs  = [c["h"] for c in recent]
-    lows   = [c["l"] for c in recent]
-    vols   = [c["v"] for c in recent]
-    pr     = (max(highs) - min(lows)) / max(min(lows), 1) * 100
-    if pr >= 3.0: return {"confirmed": False}
-    rt, rb  = max(highs), min(lows)
-    tol     = pr * 0.12
-    top_t   = sum(1 for h in highs if abs(h - rt) / max(rt, 1) * 100 < tol)
-    bot_t   = sum(1 for l in lows  if abs(l - rb) / max(rb, 1) * 100 < tol)
-    if top_t < 2 and bot_t < 2: return {"confirmed": False}
-    if not (vols[-1] < vols[0] and 0 <= oi_delta <= 5): return {"active": True, "confirmed": False}
-    avg_v   = sum(vols[:-3]) / max(len(vols[:-3]), 1)
-    avg_s   = sum(c["h"] - c["l"] for c in recent[:-3]) / max(len(recent[:-3]), 1)
-    for c in candles_5m[-5:]:
-        bt    = c["h"] > rt * 1.002
-        bb    = c["l"] < rb * 0.998
-        back  = rb < candles_5m[-1]["c"] < rt
-        spike = c["v"] > avg_v * 1.3 or (c["h"] - c["l"]) > avg_s * 1.3
-        if (bt or bb) and back and spike:
-            return {
-                "confirmed":  True,
-                "fake":       "up" if bt else "down",
-                "signal":     "SHORT" if bt else "LONG",
-                "fvg_top":    rt,
-                "fvg_bot":    rb,
-                "range_pct":  round(pr, 2),
-            }
-    return {"active": True, "confirmed": False}
-
+    """Equal highs/lows = stop clusters = liquidity pools"""
+    if len(candles) < 30:
+        return {"clusters_above": [], "clusters_below": []}
+    tol = 0.0015
+    hs = [c["h"] for c in candles[-60:]]
+    ls = [c["l"] for c in candles[-60:]]
+    ca = list(set(
+        round(h, 6) for i, h in enumerate(hs)
+        if sum(1 for hh in hs[i+1:] if abs(hh - h) / max(h, 1) < tol) >= 2
+    ))[:4]
+    cb = list(set(
+        round(l, 6) for i, l in enumerate(ls)
+        if sum(1 for ll in ls[i+1:] if abs(ll - l) / max(l, 1) < tol) >= 2
+    ))[:4]
+    return {"clusters_above": ca, "clusters_below": cb}
 
 def vol_ratio(candles):
     if len(candles) < 20: return 1.0
@@ -403,373 +361,358 @@ def vol_ratio(candles):
     rec = sum(c["v"] for c in candles[-5:]) / 5
     return rec / max(avg, 0.001)
 
+def detect_vol_spike(candles):
+    if len(candles) < 20: return False
+    avg = sum(c["v"] for c in candles[-20:-1]) / 19
+    return candles[-1]["v"] > avg * 2.5
+
 
 # ══════════════════════════════════════════
-#  SMART MONEY SCORING
+#  4-PILLAR CONFIDENCE SCORING
 # ══════════════════════════════════════════
-def sm_score(ticker, oi, funding, liqs, ob,
-             cvd_5m, fvg_5m, obs_5m, sweep_5m, liq_clusters,
-             cvd_1h, sweep_1h, amd, vr):
-    score = 0.0
-    reasons = []
-    confluence = []   # list of aligned signals
+def score_all(ticker, oi, funding, liqs, ob_data, ls_ratio,
+              cvd5, cvd15, sw5, sw15, fvg5, fvg15, ob5, ob15,
+              liq_cl, struct, phase, price, vr, vol_spike):
 
-    price = ticker["price"]
-    change = ticker["change"]
+    dl, ds = 0.0, 0.0   # derivatives long/short
+    fl, fs = 0.0, 0.0   # order flow
+    ll, ls = 0.0, 0.0   # liquidity
+    sl, ss = 0.0, 0.0   # structure
 
-    # ── 1. LIQUIDITY SWEEP ─────────────────────────────
-    if sweep_5m["bull_sweep"]:
-        score += 2.0
-        pct = sweep_5m["sweep_pct_bull"]
-        reasons.append(f"💧 Bull Liquidity Sweep: взяли стопи нижче, ціна повернулась ({pct:.2f}%)")
-        confluence.append("bull_sweep")
-    if sweep_5m["bear_sweep"]:
-        score -= 2.0
-        pct = sweep_5m["sweep_pct_bear"]
-        reasons.append(f"💧 Bear Liquidity Sweep: взяли стопи вище, ціна впала ({pct:.2f}%)")
-        confluence.append("bear_sweep")
+    rl, rs = [], []      # reasons
 
-    # 1h sweep confirmation
-    if sweep_1h["bull_sweep"]:
-        score += 1.0; reasons.append("💧 Bull Sweep підтверджений на 1H структурі")
-    if sweep_1h["bear_sweep"]:
-        score -= 1.0; reasons.append("💧 Bear Sweep підтверджений на 1H структурі")
-
-    # ── 2. FAIR VALUE GAP ──────────────────────────────
-    recent_fvgs = fvg_5m[-3:] if fvg_5m else []
-    for fvg in recent_fvgs:
-        if fvg["type"] == "bullish" and fvg["bot"] <= price <= fvg["top"]:
-            score += 1.5
-            reasons.append(f"📐 Ціна в Bullish FVG зоні: ${fvg['bot']:.4f}–${fvg['top']:.4f} ({fvg['size']:.2f}%)")
-            confluence.append("fvg_bull")
-        elif fvg["type"] == "bearish" and fvg["bot"] <= price <= fvg["top"]:
-            score -= 1.5
-            reasons.append(f"📐 Ціна в Bearish FVG зоні: ${fvg['bot']:.4f}–${fvg['top']:.4f} ({fvg['size']:.2f}%)")
-            confluence.append("fvg_bear")
-
-    # ── 3. ORDER BLOCKS ────────────────────────────────
-    for ob_zone in (obs_5m or [])[-3:]:
-        if ob_zone["type"] == "bullish" and ob_zone["bot"] <= price <= ob_zone["top"] * 1.005:
-            score += 1.5
-            reasons.append(f"🟩 Bullish Order Block: ${ob_zone['bot']:.4f}–${ob_zone['top']:.4f}")
-            confluence.append("ob_bull")
-        elif ob_zone["type"] == "bearish" and ob_zone["bot"] * 0.995 <= price <= ob_zone["top"]:
-            score -= 1.5
-            reasons.append(f"🟥 Bearish Order Block: ${ob_zone['bot']:.4f}–${ob_zone['top']:.4f}")
-            confluence.append("ob_bear")
-
-    # ── 4. CVD DIVERGENCE ──────────────────────────────
-    if cvd_5m["divergence"] == 1:
-        score += 1.5
-        reasons.append("📊 Bullish CVD дивергенція: ціна ↓ але об'єм купівлі ↑")
-        confluence.append("cvd_bull")
-    elif cvd_5m["divergence"] == -1:
-        score -= 1.5
-        reasons.append("📊 Bearish CVD дивергенція: ціна ↑ але об'єм продажу ↑")
-        confluence.append("cvd_bear")
-    if cvd_5m["absorption"]:
-        # Absorption is bullish if price didn't fall (smart money buying)
-        if change > 0:
-            score += 0.8; reasons.append("🧲 Absorption detected: великий об'єм без руху = накопичення")
-        else:
-            score -= 0.8; reasons.append("🧲 Absorption detected: великий об'єм без руху = дистрибуція")
-
-    # ── 5. OPEN INTEREST ───────────────────────────────
     d15 = oi["delta_15m"]
     d1h = oi["delta_1h"]
-    price_up = change > 0
+    fr  = funding["rate"]
+    liq_r = liqs["ratio"]
+    im  = ob_data["imbalance"]
+    bp  = cvd5["buying_pressure"]
+    lsr = ls_ratio.get("ratio", 1)
+    chg = ticker["change"]
 
+    # ── PILLAR 1: DERIVATIVES (25pts) ──────────────────
+    # OI
     if d15 > 5:
-        score += 1.5; reasons.append(f"📈 OI екстрем +{d15:.1f}% за 15хв — агресивне відкриття")
-    elif d15 > 2 and price_up:
-        score += 1.0; reasons.append(f"📈 OI +{d15:.1f}% + ціна ↑ — накопичення лонгів")
-    elif d15 > 2 and not price_up:
-        score -= 1.0; reasons.append(f"📈 OI +{d15:.1f}% + ціна ↓ — накопичення шортів")
+        dl += 8; rl.append(f"OI +{d15:.1f}% aggressive — strong longs entering")
+    elif d15 > 2 and chg > 0:
+        dl += 5; rl.append(f"OI +{d15:.1f}% + price up — long accumulation")
+    elif d15 > 2 and chg < 0:
+        ds += 5; rs.append(f"OI +{d15:.1f}% + price down — short accumulation")
     elif d15 < -3:
-        score -= 0.8; reasons.append(f"📉 OI −{abs(d15):.1f}% — закриття позицій")
-
+        ds += 4; rs.append(f"OI -{abs(d15):.1f}% — longs closing")
     if d1h > 5:
-        score += 0.5; reasons.append(f"📈 OI +{d1h:.1f}% за 1H — сильний тренд")
-
-    # ── 6. FUNDING RATE ────────────────────────────────
-    fr = funding["rate"]
-    if funding["extreme_long"]:
-        score -= 1.5; reasons.append(f"💸 Funding перекупленість {fr*100:.4f}% — SHORT тиск")
-    elif funding["extreme_short"]:
-        score += 1.5; reasons.append(f"💸 Funding перепроданість {fr*100:.4f}% — LONG тиск")
-    elif funding["bearish"]:
-        score -= 0.5; reasons.append(f"💸 Funding {fr*100:.4f}% — помірний ведмежий тиск")
+        dl += 4; rl.append(f"OI 1H +{d1h:.1f}% — strong bullish trend")
+    elif d1h < -5:
+        ds += 4; rs.append(f"OI 1H -{abs(d1h):.1f}% — strong bearish trend")
+    # Funding
+    if funding["extreme_short"]:
+        dl += 8; rl.append(f"Funding oversold {fr*100:.4f}% — long squeeze coming")
     elif funding["bullish"]:
-        score += 0.5; reasons.append(f"💸 Funding {fr*100:.4f}% — помірний бичачий тиск")
+        dl += 4; rl.append(f"Funding {fr*100:.4f}% — bullish bias")
+    elif funding["extreme_long"]:
+        ds += 8; rs.append(f"Funding overbought {fr*100:.4f}% — short squeeze coming")
+    elif funding["bearish"]:
+        ds += 4; rs.append(f"Funding {fr*100:.4f}% — bearish bias")
+    # Liquidations
+    if liq_r > 3:
+        dl += 8; rl.append(f"Mass long liquidations x{liq_r:.1f} — bull reversal")
+    elif liq_r > 2:
+        dl += 5; rl.append(f"Long liquidations x{liq_r:.1f} — bullish signal")
+    elif liq_r < 0.33:
+        ds += 8; rs.append(f"Mass short liquidations — bear reversal")
+    elif liq_r < 0.5:
+        ds += 5; rs.append(f"Short liquidations — bearish signal")
+    # L/S ratio
+    if lsr < 0.7:
+        dl += 5; rl.append(f"L/S ratio {lsr:.2f} — crowd is short = squeeze up possible")
+    elif lsr > 1.4:
+        ds += 5; rs.append(f"L/S ratio {lsr:.2f} — crowd is long = squeeze down possible")
+    # Pump/dump
+    if vol_spike and chg > 3:
+        dl += 4; rl.append("Volume spike + price up — pump signal")
+    elif vol_spike and chg < -3:
+        ds += 4; rs.append("Volume spike + price down — dump signal")
 
-    # ── 7. LIQUIDATIONS ────────────────────────────────
-    r = liqs["ratio"]
-    if r > 3:
-        score += 1.5; reasons.append(f"💥 Масові лонг-ліквідації x{r:.1f} → бичачий розворот")
-        confluence.append("liq_bull")
-    elif r > 2:
-        score += 1.0; reasons.append(f"💥 Лонг-ліквідації x{r:.1f} → бичачий сигнал")
-    elif r < 0.33:
-        score -= 1.5; reasons.append(f"💥 Масові шорт-ліквідації x{1/max(r,.001):.1f} → ведмежий розворот")
-        confluence.append("liq_bear")
-    elif r < 0.5:
-        score -= 1.0; reasons.append(f"💥 Шорт-ліквідації x{1/max(r,.001):.1f} → ведмежий сигнал")
-
-    # ── 8. ORDERBOOK IMBALANCE ─────────────────────────
-    im = ob["imbalance"]
+    # ── PILLAR 2: ORDER FLOW (25pts) ───────────────────
+    # CVD divergence
+    if cvd5["divergence"] == 1:
+        fl += 8; rl.append("CVD bullish div: price down but buyers dominate")
+    elif cvd5["divergence"] == -1:
+        fs += 8; rs.append("CVD bearish div: price up but sellers dominate")
+    if cvd15["divergence"] == 1:
+        fl += 5; rl.append("CVD 15M bullish — confirms long")
+    elif cvd15["divergence"] == -1:
+        fs += 5; rs.append("CVD 15M bearish — confirms short")
+    # Buying pressure
+    if bp > 65:
+        fl += 7; rl.append(f"Buy pressure {bp:.0f}% — aggressive buyers")
+    elif bp < 35:
+        fs += 7; rs.append(f"Sell pressure {100-bp:.0f}% — aggressive sellers")
+    # Absorption
+    if cvd5["absorption"]:
+        if chg >= 0:
+            fl += 6; rl.append("Absorption: high volume no move = smart money buying")
+        else:
+            fs += 6; rs.append("Absorption: high volume no move = smart money selling")
+    # OB imbalance
     if im > 0.25:
-        score += 1.2; reasons.append(f"📖 OB сильний тиск покупців {im:+.2f}")
+        fl += 7; rl.append(f"OB strong buy pressure {im:+.2f}")
     elif im > 0.12:
-        score += 0.6; reasons.append(f"📖 OB тиск покупців {im:+.2f}")
+        fl += 4; rl.append(f"OB buy pressure {im:+.2f}")
     elif im < -0.25:
-        score -= 1.2; reasons.append(f"📖 OB сильний тиск продавців {im:+.2f}")
+        fs += 7; rs.append(f"OB strong sell pressure {im:+.2f}")
     elif im < -0.12:
-        score -= 0.6; reasons.append(f"📖 OB тиск продавців {im:+.2f}")
+        fs += 4; rs.append(f"OB sell pressure {im:+.2f}")
 
-    # ── 9. LIQUIDITY CLUSTERS ─────────────────────────
-    clusters_above = liq_clusters.get("clusters_above", [])
-    clusters_below = liq_clusters.get("clusters_below", [])
-    if clusters_above:
-        # Price near cluster above = target for sweep up
-        nearest = min(clusters_above, key=lambda x: abs(x - price))
-        if abs(nearest - price) / price < 0.02:
-            score += 0.5; reasons.append(f"🎯 Liquidity cluster above: ${nearest:.4f} — ймовірний таргет")
-    if clusters_below:
-        nearest = min(clusters_below, key=lambda x: abs(x - price))
-        if abs(nearest - price) / price < 0.02:
-            score -= 0.5; reasons.append(f"🎯 Liquidity cluster below: ${nearest:.4f} — ймовірний таргет")
+    # ── PILLAR 3: LIQUIDITY (25pts) ────────────────────
+    # Sweeps — most important SM signal
+    if sw5["bull_sweep"]:
+        ll += 12; rl.append(f"Liquidity Sweep: stops below taken ({sw5['sweep_pct_bull']:.2f}%) -> LONG")
+    if sw5["bear_sweep"]:
+        ls += 12; rs.append(f"Liquidity Sweep: stops above taken ({sw5['sweep_pct_bear']:.2f}%) -> SHORT")
+    if sw15["bull_sweep"]:
+        ll += 6; rl.append("15M sweep below — confirms long bias")
+    if sw15["bear_sweep"]:
+        ls += 6; rs.append("15M sweep above — confirms short bias")
+    # FVG
+    for fvg in (fvg5 + fvg15)[-6:]:
+        iz = fvg["bot"] <= price <= fvg["top"]
+        if fvg["type"] == "bullish" and (iz or price < fvg["mid"] * 1.005):
+            ll += 5; rl.append(f"Bullish FVG: ${fvg['bot']:.4f}-${fvg['top']:.4f} ({fvg['size']:.2f}%)")
+        elif fvg["type"] == "bearish" and (iz or price > fvg["mid"] * 0.995):
+            ls += 5; rs.append(f"Bearish FVG: ${fvg['bot']:.4f}-${fvg['top']:.4f} ({fvg['size']:.2f}%)")
+    # Order Blocks
+    for ob_z in (ob5 + ob15)[-6:]:
+        if ob_z["type"] == "bullish" and ob_z["bot"] <= price <= ob_z["top"] * 1.01:
+            ll += 5; rl.append(f"Bullish OB: ${ob_z['bot']:.4f}-${ob_z['top']:.4f}")
+        elif ob_z["type"] == "bearish" and ob_z["bot"] * 0.99 <= price <= ob_z["top"]:
+            ls += 5; rs.append(f"Bearish OB: ${ob_z['bot']:.4f}-${ob_z['top']:.4f}")
+    # Liq clusters as targets
+    for cl in liq_cl.get("clusters_above", []):
+        if abs(cl - price) / max(price, 1) < 0.03:
+            ll += 3; rl.append(f"Liq cluster above ${cl:.4f} — magnet target")
+    for cl in liq_cl.get("clusters_below", []):
+        if abs(cl - price) / max(price, 1) < 0.03:
+            ls += 3; rs.append(f"Liq cluster below ${cl:.4f} — magnet target")
 
-    # ── 10. AMD OVERRIDE ──────────────────────────────
-    amd_active = False
-    if amd.get("confirmed"):
-        amd_score = 4.0 if amd["signal"] == "LONG" else -4.0
-        score += amd_score
-        amd_active = True
-        reasons.insert(0, f"⚡ AMD підтверджений: фейк {amd['fake'].upper()} → {amd['signal']} | FVG ${amd['fvg_bot']:.2f}–${amd['fvg_top']:.2f}")
+    # ── PILLAR 4: STRUCTURE (25pts) ────────────────────
+    if struct["phase"] == "uptrend":
+        sl += 12; rl.append("Structure 15M: HH/HL — uptrend confirmed")
+    elif struct["phase"] == "downtrend":
+        ss += 12; rs.append("Structure 15M: LH/LL — downtrend confirmed")
+    elif struct["phase"] == "range":
+        # Only sweep setups work in range
+        if sw5["bull_sweep"]: sl += 6
+        elif sw5["bear_sweep"]: ss += 6
+    # Market phase
+    if phase == "accumulation":
+        sl += 8; rl.append("Phase: accumulation — expecting move up")
+    elif phase == "distribution":
+        ss += 8; rs.append("Phase: distribution — expecting move down")
+    elif phase == "expansion":
+        sl += 5; rl.append("Phase: expansion upward")
+    # 24H position
+    pp = (price - ticker["low"]) / max(ticker["high"] - ticker["low"], 0.001) * 100
+    if pp < 25:
+        sl += 8; rl.append(f"Price near 24H low ({pp:.0f}%) — upside potential")
+    elif pp > 75:
+        ss += 8; rs.append(f"Price near 24H high ({pp:.0f}%) — downside potential")
 
-    # ── Volume filter ─────────────────────────────────
-    if vr < 0.4:
-        reasons.append(f"⚠️ Дуже низький об'єм {vr:.0%} — обережно")
-        score *= 0.6
+    # ── FINAL CONFIDENCE ───────────────────────────────
+    conf_long  = int(min(25, dl) + min(25, fl) + min(25, ll) + min(25, sl))
+    conf_short = int(min(25, ds) + min(25, fs) + min(25, ls) + min(25, ss))
 
-    # ── Confluence bonus ──────────────────────────────
-    bull_conf = sum(1 for c in confluence if "bull" in c or "sweep" == "bull_sweep")
-    bear_conf = sum(1 for c in confluence if "bear" in c)
-    if bull_conf >= 3:
-        score += 0.8; reasons.append(f"🔗 Confluence: {bull_conf} бичачих сигналів збіглись")
-    if bear_conf >= 3:
-        score -= 0.8; reasons.append(f"🔗 Confluence: {bear_conf} ведмежих сигналів збіглись")
-
-    return score, reasons, amd_active
+    return conf_long, conf_short, rl, rs
 
 
 # ══════════════════════════════════════════
-#  DYNAMIC TP/SL (structure-based)
+#  STRUCTURE-BASED TP/SL
 # ══════════════════════════════════════════
-def calc_tp_sl(price, direction, candles, fvgs, obs, liq_clusters, ticker):
-    """
-    SL: behind nearest OB or FVG
-    TP: next FVG fill or liquidity cluster
-    Minimum RR: 1:3
-    """
-    high24 = ticker["high"]
-    low24  = ticker["low"]
-
-    # Find ATR-equivalent via recent range
-    recent = candles[-20:]
-    avg_range = sum(c["h"] - c["l"] for c in recent) / len(recent)
-    atr = avg_range * 1.2
+def calc_levels(price, direction, candles, fvg5, fvg15, ob5, liq_cl, ticker):
+    recent   = candles[-20:]
+    avg_rng  = sum(c["h"] - c["l"] for c in recent) / max(len(recent), 1)
+    atr      = avg_rng * 1.3
 
     if direction == "LONG":
-        # SL: below nearest bullish OB or 1.5x ATR
-        sl_candidates = [price - atr * 1.5]
-        for ob_z in (obs or []):
+        # SL: below nearest bullish OB or FVG
+        sl_cands = [price - atr * 1.5]
+        for ob_z in ob5:
             if ob_z["type"] == "bullish" and ob_z["bot"] < price:
-                sl_candidates.append(ob_z["bot"] * 0.998)
-        for fvg in (fvgs or []):
+                sl_cands.append(ob_z["bot"] * 0.997)
+        for fvg in fvg5 + fvg15:
             if fvg["type"] == "bullish" and fvg["bot"] < price:
-                sl_candidates.append(fvg["bot"] * 0.998)
-        sl = max(sl_candidates)  # tightest SL above the lowest
-
-        # TP: next bearish FVG fill or liquidity cluster above
-        tp_candidates = [price + atr * 4]  # minimum RR 1:4
-        # Next bearish FVG above price
-        for fvg in sorted((f for f in (fvgs or []) if f["type"] == "bearish" and f["bot"] > price), key=lambda x: x["bot"]):
-            tp_candidates.append(fvg["mid"] * 0.998)
-            break
-        # Liquidity clusters above
-        for cl in sorted((c for c in liq_clusters.get("clusters_above", []) if c > price)):
-            tp_candidates.append(cl * 0.999)
-            break
-        # 24h high
-        if high24 > price * 1.02:
-            tp_candidates.append(high24 * 0.999)
-        tp = max(p for p in tp_candidates if p > price + atr * 3)
-        if tp is None or tp <= price:
-            tp = price + atr * 4
-
-    else:  # SHORT
-        # SL: above nearest bearish OB or 1.5x ATR
-        sl_candidates = [price + atr * 1.5]
-        for ob_z in (obs or []):
+                sl_cands.append(fvg["bot"] * 0.997)
+        sl     = max(sl_cands)
+        sl_d   = price - sl
+        tp1    = price + sl_d * 1.5
+        tp2    = price + sl_d * 2.5
+        tp3    = price + sl_d * 4.0
+        # Override TP3 with nearest liq cluster above
+        for cl in sorted(liq_cl.get("clusters_above", [])):
+            if cl > price * 1.01: tp3 = cl * 0.999; break
+        if ticker["high"] > price * 1.02:
+            tp3 = max(tp3, ticker["high"] * 0.999)
+    else:
+        sl_cands = [price + atr * 1.5]
+        for ob_z in ob5:
             if ob_z["type"] == "bearish" and ob_z["top"] > price:
-                sl_candidates.append(ob_z["top"] * 1.002)
-        for fvg in (fvgs or []):
+                sl_cands.append(ob_z["top"] * 1.003)
+        for fvg in fvg5 + fvg15:
             if fvg["type"] == "bearish" and fvg["top"] > price:
-                sl_candidates.append(fvg["top"] * 1.002)
-        sl = min(sl_candidates)
+                sl_cands.append(fvg["top"] * 1.003)
+        sl     = min(sl_cands)
+        sl_d   = sl - price
+        tp1    = price - sl_d * 1.5
+        tp2    = price - sl_d * 2.5
+        tp3    = price - sl_d * 4.0
+        for cl in sorted(liq_cl.get("clusters_below", []), reverse=True):
+            if cl < price * 0.99: tp3 = cl * 1.002; break
+        if ticker["low"] < price * 0.98:
+            tp3 = min(tp3, ticker["low"] * 1.002)
 
-        # TP: next bullish FVG fill or liquidity cluster below
-        tp_candidates = [price - atr * 4]
-        for fvg in sorted((f for f in (fvgs or []) if f["type"] == "bullish" and f["top"] < price), key=lambda x: -x["top"]):
-            tp_candidates.append(fvg["mid"] * 1.002)
-            break
-        for cl in sorted((c for c in liq_clusters.get("clusters_below", []) if c < price), reverse=True):
-            tp_candidates.append(cl * 1.001)
-            break
-        if low24 < price * 0.98:
-            tp_candidates.append(low24 * 1.001)
-        tp = min(p for p in tp_candidates if p < price - atr * 3)
-        if tp is None or tp >= price:
-            tp = price - atr * 4
-
-    sl_dist = abs(price - sl)
-    tp_dist = abs(price - tp)
-    rr = tp_dist / max(sl_dist, 0.0001)
-    move_pct = tp_dist / price * 100
-
-    return tp, sl, rr, move_pct
+    rr       = abs(tp2 - price) / max(abs(sl - price), 0.0001)
+    move_pct = abs(tp2 - price) / max(price, 1) * 100
+    return tp1, tp2, tp3, sl, rr, move_pct
 
 
 # ══════════════════════════════════════════
 #  MAIN ANALYSIS
 # ══════════════════════════════════════════
-async def analyze_symbol(sym):
+async def analyze_symbol(sym: str):
     try:
-        ticker, c5m, c1h, oi, funding, liqs, ob_data = await asyncio.gather(
+        # Fetch all data in parallel
+        ticker, c5m, c15m, oi, funding, liqs, ob_data, ls = await asyncio.gather(
             get_ticker(sym),
-            get_klines(sym, "5m", 150),
-            get_klines(sym, "1h",  50),
+            get_klines(sym, "5m",  150),
+            get_klines(sym, "15m", 80),
             get_oi(sym),
             get_funding(sym),
             get_liqs(sym),
-            get_ob(sym, 100),
+            get_ob(sym),
+            get_ls(sym),
         )
 
-        if not ticker or len(c5m) < 30:
+        if not ticker or len(c5m) < 30 or len(c15m) < 10:
             return None
 
         price = ticker["price"]
 
-        # ── Smart Money Structure ──
-        fvg_5m       = detect_fvg(c5m, 50)
-        obs_5m       = detect_order_blocks(c5m, 80)
-        sweep_5m     = detect_liquidity_sweep(c5m, 50)
-        cvd_5m       = detect_cvd_divergence(c5m)
-        liq_clusters = detect_liq_clusters(c5m)
-        amd          = detect_amd(c5m, oi["delta_15m"])
-        sweep_1h     = detect_liquidity_sweep(c1h, 30)
-        cvd_1h       = detect_cvd_divergence(c1h)
-        vr           = vol_ratio(c5m)
+        # ── Pre-filters ───────────────────────────────
+        # Flat market — skip
+        if detect_flat(c15m):
+            sw_check = detect_sweep(c5m, 60)
+            if not sw_check["bull_sweep"] and not sw_check["bear_sweep"]:
+                r = no_trade(sym, price, oi["delta_15m"], funding["rate"],
+                             liqs["ratio"], ob_data["imbalance"], "Flat market — skip")
+                cache[sym] = r; return r
 
-        # ── Score ──
-        score, reasons, amd_active = sm_score(
-            ticker, oi, funding, liqs, ob_data,
-            cvd_5m, fvg_5m, obs_5m, sweep_5m, liq_clusters,
-            cvd_1h, sweep_1h, amd, vr
+        # Low volume — skip
+        vr = vol_ratio(c5m)
+        vol_spike = detect_vol_spike(c5m)
+        if vr < 0.35 and not vol_spike:
+            r = no_trade(sym, price, oi["delta_15m"], funding["rate"],
+                         liqs["ratio"], ob_data["imbalance"], "Low volume — no liquidity")
+            cache[sym] = r; return r
+
+        # ── SM detectors ──────────────────────────────
+        struct = detect_market_structure(c15m)
+        phase  = detect_market_phase(c5m, oi["delta_15m"])
+        fvg5   = detect_fvg(c5m,  60)
+        fvg15  = detect_fvg(c15m, 40)
+        ob5    = detect_obs(c5m,  100)
+        ob15   = detect_obs(c15m, 60)
+        sw5    = detect_sweep(c5m,  60)
+        sw15   = detect_sweep(c15m, 40)
+        cvd5   = detect_cvd(c5m)
+        cvd15  = detect_cvd(c15m)
+        liq_cl = detect_liq_clusters(c5m)
+
+        # ── 4-pillar score ────────────────────────────
+        conf_long, conf_short, rl, rs = score_all(
+            ticker, oi, funding, liqs, ob_data, ls,
+            cvd5, cvd15, sw5, sw15, fvg5, fvg15, ob5, ob15,
+            liq_cl, struct, phase, price, vr, vol_spike
         )
 
-        # ── Decision ──
-        if   score >= 3.0:  direction = "LONG"
-        elif score <= -3.0: direction = "SHORT"
-        else:               direction = "NO TRADE"
+        # ── Decision — ALL conditions must align ──────
+        if conf_long >= MIN_CONFIDENCE and conf_long > conf_short:
+            direction  = "LONG"
+            confidence = conf_long
+            reasons    = rl[:7]
+        elif conf_short >= MIN_CONFIDENCE and conf_short > conf_long:
+            direction  = "SHORT"
+            confidence = conf_short
+            reasons    = rs[:7]
+        else:
+            r = no_trade(sym, price, oi["delta_15m"], funding["rate"],
+                         liqs["ratio"], ob_data["imbalance"],
+                         f"Conf LONG={conf_long}% SHORT={conf_short}% — below {MIN_CONFIDENCE}%")
+            cache[sym] = r; return r
 
-        structure = {
-            "price":      price,
-            "change":     ticker["change"],
-            "score":      round(score, 2),
-            "oi_15m":     oi["delta_15m"],
-            "oi_1h":      oi["delta_1h"],
-            "funding":    funding["rate"],
-            "liq_ratio":  liqs["ratio"],
-            "ob_imb":     ob_data["imbalance"],
-            "cvd_div":    cvd_5m["divergence"],
-            "fvg_count":  len(fvg_5m),
-            "ob_count":   len(obs_5m),
-            "bull_sweep": sweep_5m["bull_sweep"],
-            "bear_sweep": sweep_5m["bear_sweep"],
-            "amd":        amd.get("confirmed", False),
-            "vol_ratio":  vr,
+        # ── TP/SL ─────────────────────────────────────
+        tp1, tp2, tp3, sl, rr, move_pct = calc_levels(
+            price, direction, c5m, fvg5, fvg15, ob5, liq_cl, ticker
+        )
+
+        # Filter bad RR
+        if rr < 1.5:
+            r = no_trade(sym, price, oi["delta_15m"], funding["rate"],
+                         liqs["ratio"], ob_data["imbalance"],
+                         f"RR {rr:.1f} < 1:1.5 — skip")
+            cache[sym] = r; return r
+
+        # ── Leverage ──────────────────────────────────
+        lev = 10 if confidence >= 90 else 7 if confidence >= 85 else 5 if confidence >= 80 else 3
+
+        # ── Strategy label ────────────────────────────
+        sp = []
+        if sw5["bull_sweep"] or sw5["bear_sweep"]: sp.append("SWEEP")
+        if any(f["bot"] <= price <= f["top"] for f in fvg5 + fvg15): sp.append("FVG")
+        if any(o["bot"] <= price <= o["top"] * 1.01 for o in ob5 + ob15): sp.append("OB")
+        if cvd5["divergence"] != 0: sp.append("CVD")
+        strategy = "+".join(sp) if sp else "SMART_MONEY"
+
+        raw = {
+            "price":         price,
+            "change":        ticker["change"],
+            "oi_15m":        oi["delta_15m"],
+            "oi_1h":         oi["delta_1h"],
+            "funding":       funding["rate"],
+            "liq_ratio":     liqs["ratio"],
+            "ob_imb":        ob_data["imbalance"],
+            "cvd_div":       cvd5["divergence"],
+            "buying_pressure": cvd5["buying_pressure"],
+            "bull_sweep":    sw5["bull_sweep"],
+            "bear_sweep":    sw5["bear_sweep"],
+            "fvg_count":     len(fvg5 + fvg15),
+            "ob_count":      len(ob5 + ob15),
+            "structure":     struct["phase"],
+            "phase":         phase,
+            "vol_ratio":     vr,
+            "ls_ratio":      ls.get("ratio", 1),
+            "conf_long":     conf_long,
+            "conf_short":    conf_short,
         }
 
-        if direction == "NO TRADE":
-            result = Signal(
-                sym, "NO TRADE", 0, "STANDARD",
-                price, price, price, 0, 0, 1,
-                [f"Score {score:.1f} | Нема чіткої структури"] if not reasons else reasons[:3],
-                structure
-            ).to_dict()
-            cache[sym] = result
-            return result
+        # ── Cooldown check ────────────────────────────
+        prev          = cache.get(sym, {})
+        prev_decision = prev.get("decision", "NO TRADE")
+        prev_ts       = prev.get("ts", 0)
+        now           = time.time()
+        cooldown_ok   = (now - _last_signal.get(sym, 0)) > SIGNAL_COOLDOWN
+        direction_changed = prev_decision != direction
 
-        # ── TP/SL ──
-        tp, sl, rr, move_pct = calc_tp_sl(price, direction, c5m, fvg_5m, obs_5m, liq_clusters, ticker)
-
-        # Filter: min RR 1:3, min move 2%
-        if rr < 3.0:
-            cache[sym] = Signal(
-                sym, "NO TRADE", 0, "STANDARD",
-                price, price, price, 0, 0, 1,
-                [f"RR {rr:.1f}:1 < 1:3 — пропускаємо"], structure
-            ).to_dict()
-            return cache[sym]
-
-        if move_pct < 2.0:
-            cache[sym] = Signal(
-                sym, "NO TRADE", 0, "STANDARD",
-                price, price, price, 0, 0, 1,
-                [f"Рух {move_pct:.1f}% < 2% — нецікаво"], structure
-            ).to_dict()
-            return cache[sym]
-
-        # Confidence
-        base_conf = 40 + abs(score) * 7
-        if amd_active:   base_conf += 20
-        if rr >= 5:      base_conf += 10
-        if rr >= 4:      base_conf += 5
-        if move_pct >= 5:base_conf += 5
-        if sweep_5m["bull_sweep"] or sweep_5m["bear_sweep"]: base_conf += 8
-        if len(fvg_5m) > 0: base_conf += 5
-        conf = min(95, max(35, int(base_conf)))
-
-        # Leverage
-        lev = 5 if conf >= 85 else 3 if conf >= 75 else 2 if conf >= 65 else 1
-
-        strategy = "AMD_FVG" if amd_active else (
-            "SWEEP" if (sweep_5m["bull_sweep"] or sweep_5m["bear_sweep"]) else
-            "FVG" if fvg_5m else "OB" if obs_5m else "STANDARD"
-        )
-
-        prev = cache.get(sym, {})
-        is_new = prev.get("decision") != direction
-
-        sig = Signal(sym, direction, conf, strategy, price, tp, sl,
-                     rr, move_pct, lev, reasons[:6], structure)
+        sig = Signal(sym, direction, confidence, strategy,
+                     price, tp1, tp2, tp3, sl, rr, move_pct, lev, reasons, raw)
         cache[sym] = sig.to_dict()
 
-        log.info(f"[{sym}] {direction} conf={conf}% RR={rr:.1f} move={move_pct:.1f}% strat={strategy}")
+        log.info(f"[{sym}] {direction} conf={confidence}% RR={rr:.1f} "
+                 f"move={move_pct:.1f}% {strategy} cooldown={cooldown_ok}")
 
-        if is_new and direction != "NO TRADE" and conf >= 60:
-            await notify(
-                f"{'🟢' if direction=='LONG' else '🔴'} *{direction}* `{sym}`\n\n"
-                f"💲 Entry: `${price:,.4f}`\n"
-                f"🎯 TP: `${tp:,.4f}` (+{move_pct:.1f}%)\n"
-                f"🛑 SL: `${sl:,.4f}`\n"
-                f"📐 RR: `1:{rr:.1f}`\n"
-                f"⚡ Lev: `{lev}x` | Conf: `{conf}%`\n"
-                f"🧠 `{strategy}`\n\n"
-                + "\n".join(f"• {r}" for r in reasons[:4])
-            )
+        # Fire notification only if: new direction + cooldown passed
+        if (direction_changed or cooldown_ok) and cooldown_ok:
+            _last_signal[sym] = now
+            await _tg_signal(sig)
 
         return cache[sym]
 
@@ -779,35 +722,88 @@ async def analyze_symbol(sym):
 
 
 # ══════════════════════════════════════════
-#  EXCHANGE CLIENT
+#  TELEGRAM — UTF-8 SAFE
+# ══════════════════════════════════════════
+async def notify(text: str):
+    if not TG_TOKEN or not TG_CHAT: return
+    try:
+        # Safe encode — avoids latin-1 errors
+        safe = text.encode("utf-8", errors="replace").decode("utf-8")
+        async with httpx.AsyncClient(timeout=6) as c:
+            await c.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={
+                    "chat_id":                  TG_CHAT,
+                    "text":                     safe,
+                    "parse_mode":               "Markdown",
+                    "disable_web_page_preview": True,
+                },
+            )
+    except Exception as e:
+        log.warning(f"TG notify: {e}")
+
+async def _tg_signal(sig: Signal):
+    e1 = abs(sig.tp1 - sig.entry) / max(sig.entry, 1) * 100
+    e2 = abs(sig.tp2 - sig.entry) / max(sig.entry, 1) * 100
+    e3 = abs(sig.tp3 - sig.entry) / max(sig.entry, 1) * 100
+    text = (
+        f"{'LONG' if sig.decision == 'LONG' else 'SHORT'} {sig.symbol}\n\n"
+        f"Entry: ${sig.entry:,.6f}\n"
+        f"TP1: ${sig.tp1:,.6f} (+{e1:.1f}%)\n"
+        f"TP2: ${sig.tp2:,.6f} (+{e2:.1f}%)\n"
+        f"TP3: ${sig.tp3:,.6f} (+{e3:.1f}%)\n"
+        f"SL: ${sig.sl:,.6f}\n"
+        f"RR: 1:{sig.rr:.1f} | Lev: {sig.lev}x\n"
+        f"Confidence: {sig.confidence}%\n"
+        f"Strategy: {sig.strategy}\n\n"
+        + "\n".join(f"- {r}" for r in sig.reasons[:5])
+    )
+    await notify(text)
+
+
+# ══════════════════════════════════════════
+#  EXCHANGE CLIENT — FIXED ENCODING
 # ══════════════════════════════════════════
 class ExchangeClient:
-    def __init__(self, exchange="", api_key="", api_secret="", testnet=False):
-        self.exchange   = exchange.lower()
-        self.api_key    = api_key
-        self.api_secret = api_secret
+    def __init__(self, exchange: str = "", api_key: str = "",
+                 api_secret: str = "", testnet: bool = False):
+        # Strip whitespace + encode-safe
+        self.exchange   = exchange.lower().strip()
+        self.api_key    = api_key.strip()
+        self.api_secret = api_secret.strip()
         self.testnet    = testnet
         self._ex        = None
         self.connected  = False
         self.error      = ""
-        if api_key and api_secret:
+        if self.api_key and self.api_secret:
             self._connect()
 
     def _connect(self):
         try:
             import ccxt
-            cfg = {"apiKey": self.api_key, "secret": self.api_secret,
-                   "enableRateLimit": True, "options": {"defaultType": "future"}}
-            ex_map = {"bybit": ccxt.bybit, "binance": ccxt.binanceusdm, "mexc": ccxt.mexc}
+            cfg = {
+                "apiKey":          self.api_key,
+                "secret":          self.api_secret,
+                "enableRateLimit": True,
+                "options":         {"defaultType": "future"},
+            }
+            ex_map = {
+                "bybit":   ccxt.bybit,
+                "binance": ccxt.binanceusdm,
+                "mexc":    ccxt.mexc,
+            }
             if self.exchange not in ex_map:
-                self.error = f"Unsupported exchange: {self.exchange}"; return
+                self.error = f"Unsupported exchange: {self.exchange}"
+                return
             self._ex = ex_map[self.exchange](cfg)
             if self.testnet:
                 try: self._ex.set_sandbox_mode(True)
                 except: pass
             self.connected = True
+            log.info(f"{self.exchange.upper()} connected testnet={self.testnet}")
         except Exception as e:
             self.error = str(e)
+            log.error(f"Exchange {self.exchange}: {e}")
 
     async def test_connection(self):
         if not self._ex: return False, self.error
@@ -817,14 +813,15 @@ class ExchangeClient:
         except Exception as e:
             return False, str(e)
 
-    async def get_balance(self):
+    async def get_balance(self) -> float:
         if not self._ex: return 0.0
         try:
             bal = await asyncio.to_thread(self._ex.fetch_balance)
             return float(bal.get("USDT", {}).get("free", 0))
         except: return 0.0
 
-    async def place_order(self, symbol, side, usdt, leverage, tp, sl):
+    async def place_order(self, symbol: str, side: str, usdt: float,
+                          leverage: int, tp: float, sl: float) -> dict:
         if not self._ex: return {"error": "Not connected"}
         try:
             sym_fmt = symbol.replace("USDT", "/USDT:USDT")
@@ -832,15 +829,23 @@ class ExchangeClient:
             except: pass
             ticker = await asyncio.to_thread(self._ex.fetch_ticker, sym_fmt)
             qty    = round(usdt / ticker["last"], 6)
-            order  = await asyncio.to_thread(self._ex.create_market_order, sym_fmt, side.lower(), qty)
-            cs     = "sell" if side.upper() == "BUY" else "buy"
+            order  = await asyncio.to_thread(
+                self._ex.create_market_order, sym_fmt, side.lower(), qty
+            )
+            cs = "sell" if side.upper() == "BUY" else "buy"
             try:
-                await asyncio.to_thread(self._ex.create_order, sym_fmt, "take_profit_market", cs, qty, tp,
-                                        {"stopPrice": tp, "closePosition": True, "reduceOnly": True})
-                await asyncio.to_thread(self._ex.create_order, sym_fmt, "stop_market", cs, qty, sl,
-                                        {"stopPrice": sl, "closePosition": True, "reduceOnly": True})
+                await asyncio.to_thread(
+                    self._ex.create_order, sym_fmt,
+                    "take_profit_market", cs, qty, tp,
+                    {"stopPrice": tp, "closePosition": True, "reduceOnly": True}
+                )
+                await asyncio.to_thread(
+                    self._ex.create_order, sym_fmt,
+                    "stop_market", cs, qty, sl,
+                    {"stopPrice": sl, "closePosition": True, "reduceOnly": True}
+                )
             except Exception as e:
-                log.warning(f"TP/SL: {e}")
+                log.warning(f"TP/SL not set: {e}")
             return {"id": order["id"], "status": "filled", "symbol": symbol,
                     "side": side, "amount": usdt, "price": ticker["last"], "qty": qty}
         except Exception as e:
@@ -864,27 +869,28 @@ class Agent:
         self.running   = False
         self.exchange: Optional[ExchangeClient] = None
         self.risk_pct  = 1.5
-        self.min_conf  = 65
+        self.min_conf  = MIN_CONFIDENCE
         self.max_open  = 3
         self.trades:   list[OpenTrade] = []
         self.closed:   list[OpenTrade] = []
         self.total_pnl = 0.0
         self.scans     = 0
 
-    def configure(self, exchange, risk_pct=1.5, min_conf=65, max_open=3):
-        self.exchange = exchange
-        self.risk_pct = risk_pct
-        self.min_conf = min_conf
-        self.max_open = max_open
+    def configure(self, exchange, risk_pct=1.5, min_conf=70, max_open=3):
+        self.exchange  = exchange
+        self.risk_pct  = risk_pct
+        self.min_conf  = min_conf
+        self.max_open  = max_open
 
     async def start(self):
         self.running = True
         await notify(
-            f"🟢 *AXIFLOW Agent активний*\n\n"
-            f"🏦 {self.exchange.exchange.upper()}\n"
-            f"📊 Smart Money: Sweeps · FVG · OB · CVD · AMD\n"
-            f"⚡ Конф. ≥ {self.min_conf}% | Ризик {self.risk_pct}%\n"
-            f"📐 Мін. RR 1:3 | Рух ≥ 2%"
+            f"AXIFLOW Agent started\n"
+            f"Exchange: {self.exchange.exchange.upper()}\n"
+            f"Smart Money: Sweeps FVG OB CVD\n"
+            f"Min confidence: {self.min_conf}%\n"
+            f"Risk: {self.risk_pct}% per trade\n"
+            f"Cooldown: 15 min per symbol"
         )
         while self.running:
             try:
@@ -892,7 +898,7 @@ class Agent:
                 await self._monitor()
                 self.scans += 1
             except Exception as e:
-                log.error(f"Agent: {e}")
+                log.error(f"Agent loop: {e}")
             await asyncio.sleep(30)
 
     def stop(self): self.running = False
@@ -906,105 +912,102 @@ class Agent:
             sig = cache.get(sym)
             if not sig or sig.get("decision") == "NO TRADE": continue
             if sig.get("confidence", 0) < self.min_conf: continue
-            if sig.get("rr", 0) < 3.0: continue
-            await self._open(sig)
-            if len({t.symbol for t in self.trades if t.status == "open"}) >= self.max_open: break
+            if sig.get("rr", 0) < 1.5: continue
+            # Check cooldown
+            if time.time() - _last_signal.get(sym, 0) > SIGNAL_COOLDOWN / 2:
+                await self._open(sig)
+            if len({t.symbol for t in self.trades if t.status=="open"}) >= self.max_open:
+                break
 
-    async def _open(self, sig):
+    async def _open(self, sig: dict):
         bal      = await self.exchange.get_balance()
         pos_size = bal * (self.risk_pct / 100) * sig["lev"]
         if pos_size < 5: return
         side  = "BUY" if sig["decision"] == "LONG" else "SELL"
-        order = await self.exchange.place_order(sig["symbol"], side, pos_size,
-                                                sig["lev"], sig["tp"], sig["sl"])
+        order = await self.exchange.place_order(
+            sig["symbol"], side, pos_size, sig["lev"], sig["tp"], sig["sl"]
+        )
         if "error" in order:
-            await notify(f"❌ Order error `{sig['symbol']}`:\n{order['error']}"); return
-        t = OpenTrade(id=order["id"], symbol=sig["symbol"], side=side,
-                      entry=sig["entry"], tp=sig["tp"], sl=sig["sl"],
-                      amount=pos_size, leverage=sig["lev"], exchange=self.exchange.exchange)
+            await notify(f"Order error {sig['symbol']}: {order['error']}")
+            return
+        t = OpenTrade(
+            id=order["id"], symbol=sig["symbol"], side=side,
+            entry=sig["entry"], tp=sig["tp"], sl=sig["sl"],
+            amount=pos_size, leverage=sig["lev"], exchange=self.exchange.exchange
+        )
         self.trades.append(t)
         await notify(
-            f"{'🟢' if side=='BUY' else '🔴'} *{sig['decision']} відкрито*\n\n"
-            f"📌 `{sig['symbol']}`\n"
-            f"💲 `${sig['entry']:,.4f}`\n"
-            f"🎯 TP `${sig['tp']:,.4f}` (+{sig['move_pct']:.1f}%)\n"
-            f"🛑 SL `${sig['sl']:,.4f}`\n"
-            f"📐 RR `1:{sig['rr']:.1f}` | ⚡ `{sig['lev']}x`\n"
-            f"💰 `${pos_size:.0f}` | `{sig['confidence']}%`\n"
-            f"🧠 `{sig['strategy']}`"
+            f"{'LONG' if side=='BUY' else 'SHORT'} opened {sig['symbol']}\n"
+            f"Entry: ${sig['entry']:,.4f}\n"
+            f"TP: ${sig['tp']:,.4f}\n"
+            f"SL: ${sig['sl']:,.4f}\n"
+            f"RR: 1:{sig['rr']:.1f} | {sig['lev']}x | ${pos_size:.0f}\n"
+            f"Conf: {sig['confidence']}% | {sig['strategy']}"
         )
 
     async def _monitor(self):
-        for t in [t for t in self.trades if t.status == "open"]:
-            sig = cache.get(t.symbol, {})
+        for t in [x for x in self.trades if x.status == "open"]:
+            sig   = cache.get(t.symbol, {})
             price = sig.get("raw", {}).get("price", t.entry)
             if not price: continue
             if t.side == "BUY":
-                pnl_pct = (price - t.entry) / t.entry * 100 * t.leverage
-                hit_tp  = price >= t.tp; hit_sl = price <= t.sl
+                pnl_pct = (price - t.entry) / max(t.entry, 1) * 100 * t.leverage
+                hit_tp  = price >= t.tp
+                hit_sl  = price <= t.sl
             else:
-                pnl_pct = (t.entry - price) / t.entry * 100 * t.leverage
-                hit_tp  = price <= t.tp; hit_sl = price >= t.sl
+                pnl_pct = (t.entry - price) / max(t.entry, 1) * 100 * t.leverage
+                hit_tp  = price <= t.tp
+                hit_sl  = price >= t.sl
             t.pnl = t.amount * pnl_pct / 100
             if hit_tp:
                 t.status = "tp"; self.total_pnl += t.pnl; self.closed.append(t)
-                await notify(f"✅ *TP Hit!*\n`{t.symbol}` +${t.pnl:.2f} (+{pnl_pct:.1f}%)\n📈 Total: `${self.total_pnl:.2f}`")
+                await notify(f"TP Hit {t.symbol} +${t.pnl:.2f} (+{pnl_pct:.1f}%)\nTotal: ${self.total_pnl:.2f}")
             elif hit_sl:
                 t.status = "sl"; self.total_pnl += t.pnl; self.closed.append(t)
-                await notify(f"🛑 *SL Hit*\n`{t.symbol}` ${t.pnl:.2f} ({pnl_pct:.1f}%)\n📉 Total: `${self.total_pnl:.2f}`")
+                await notify(f"SL {t.symbol} ${t.pnl:.2f} ({pnl_pct:.1f}%)\nTotal: ${self.total_pnl:.2f}")
 
-    def stats(self):
-        open_t = [t for t in self.trades if t.status == "open"]
-        wins   = [t for t in self.closed if t.pnl > 0]
+    def stats(self) -> dict:
+        ot   = [t for t in self.trades if t.status == "open"]
+        wins = [t for t in self.closed if t.pnl > 0]
         return {
-            "running":      self.running,
-            "scans":        self.scans,
-            "open_count":   len(open_t),
-            "closed_count": len(self.closed),
-            "win_rate":     round(len(wins)/max(len(self.closed),1)*100,1),
-            "total_pnl":    round(self.total_pnl, 2),
-            "exchange":     self.exchange.exchange if self.exchange else "",
-            "connected":    self.exchange.connected if self.exchange else False,
-            "open_trades":  [{"id":t.id,"symbol":t.symbol,"side":t.side,"entry":t.entry,
-                               "tp":t.tp,"sl":t.sl,"pnl":round(t.pnl,2),"lev":t.leverage,
-                               "amount":round(t.amount,2),"exchange":t.exchange} for t in open_t],
-            "closed_trades":[{"symbol":t.symbol,"side":t.side,"pnl":round(t.pnl,2),
-                               "status":t.status} for t in self.closed[-10:]],
+            "running":       self.running,
+            "scans":         self.scans,
+            "open_count":    len(ot),
+            "closed_count":  len(self.closed),
+            "win_rate":      round(len(wins) / max(len(self.closed), 1) * 100, 1),
+            "total_pnl":     round(self.total_pnl, 2),
+            "exchange":      self.exchange.exchange if self.exchange else "",
+            "connected":     self.exchange.connected if self.exchange else False,
+            "open_trades":   [
+                {"id": t.id, "symbol": t.symbol, "side": t.side,
+                 "entry": t.entry, "tp": t.tp, "sl": t.sl,
+                 "pnl": round(t.pnl, 2), "lev": t.leverage,
+                 "amount": round(t.amount, 2), "exchange": t.exchange}
+                for t in ot
+            ],
+            "closed_trades": [
+                {"symbol": t.symbol, "side": t.side,
+                 "pnl": round(t.pnl, 2), "status": t.status}
+                for t in self.closed[-10:]
+            ],
         }
 
 
 # ══════════════════════════════════════════
-#  TELEGRAM
+#  GLOBALS + SCAN LOOP
 # ══════════════════════════════════════════
-async def notify(text):
-    if not TG_TOKEN or not TG_CHAT: return
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            await c.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                         json={"chat_id": TG_CHAT, "text": text,
-                               "parse_mode": "Markdown", "disable_web_page_preview": True})
-    except Exception as e:
-        log.warning(f"TG: {e}")
-
-
-# ══════════════════════════════════════════
-#  GLOBALS
-# ══════════════════════════════════════════
-cache:         dict  = {}
-agent:         Agent = Agent()
-wallets:       dict  = {}
-manual_trades: list  = []
+agent = Agent()
 
 
 async def scan_loop():
-    log.info("Smart Money scanner started")
+    log.info("AXIFLOW v4 Smart Money scanner started")
     while True:
         try:
             for sym in SYMBOLS:
                 await analyze_symbol(sym)
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
         except Exception as e:
-            log.error(f"Scan: {e}")
+            log.error(f"Scan loop: {e}")
         await asyncio.sleep(20)
 
 
@@ -1017,8 +1020,9 @@ async def lifespan(app: FastAPI):
 # ══════════════════════════════════════════
 #  FASTAPI
 # ══════════════════════════════════════════
-app = FastAPI(title="AXIFLOW v3", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="AXIFLOW v4", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 os.makedirs(static_dir, exist_ok=True)
@@ -1027,7 +1031,7 @@ app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static"
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "AXIFLOW v3 — Pure Smart Money"}
+    return {"status": "ok", "service": "AXIFLOW v4 Pure Smart Money"}
 
 @app.get("/api/signals")
 async def signals():
@@ -1044,44 +1048,59 @@ async def signal(symbol: str, fresh: bool = False):
 async def market(symbol: str):
     sym = symbol.upper()
     ticker, oi, fr, lq, ob = await asyncio.gather(
-        get_ticker(sym), get_oi(sym), get_funding(sym), get_liqs(sym), get_ob(sym)
+        get_ticker(sym), get_oi(sym), get_funding(sym),
+        get_liqs(sym), get_ob(sym)
     )
-    return {"symbol": sym, "ticker": ticker, "oi": oi,
-            "funding": fr, "liquidations": lq, "orderbook": ob, "ts": time.time()}
+    return {"symbol": sym, "ticker": ticker, "oi": oi, "funding": fr,
+            "liquidations": lq, "orderbook": ob, "ts": time.time()}
 
 @app.get("/api/klines/{symbol}")
 async def klines(symbol: str, interval: str = "5m", limit: int = 100):
-    sym = symbol.upper()
+    sym  = symbol.upper()
     data = await get_klines(sym, interval, limit)
     return {"symbol": sym, "interval": interval, "candles": data}
 
 
+# ── Models ────────────────────────────────
 class WalletReq(BaseModel):
-    user_id: str; exchange: str = ""; api_key: str = ""
-    api_secret: str = ""; testnet: bool = False
+    user_id:    str
+    exchange:   str  = ""
+    api_key:    str  = ""
+    api_secret: str  = ""
+    testnet:    bool = False
 
 class AgentReq(BaseModel):
-    user_id: str; action: str
-    risk_pct: float = 1.5; min_conf: int = 65; max_open: int = 3
+    user_id:  str
+    action:   str
+    risk_pct: float = 1.5
+    min_conf: int   = 70
+    max_open: int   = 3
 
 class TradeReq(BaseModel):
-    user_id: str; symbol: str; side: str; amount: float; leverage: int = 1
+    user_id:  str
+    symbol:   str
+    side:     str
+    amount:   float
+    leverage: int = 1
 
 
+# ── Routes ────────────────────────────────
 @app.post("/api/wallet")
 async def connect_wallet(req: WalletReq):
     if not req.api_key or not req.api_secret:
-        return {"success": False, "error": "Введіть API ключі"}
+        return {"success": False, "error": "Enter API keys"}
     if not req.exchange:
-        return {"success": False, "error": "Виберіть біржу"}
+        return {"success": False, "error": "Select exchange"}
     ex = ExchangeClient(req.exchange, req.api_key, req.api_secret, req.testnet)
     if not ex.connected:
-        return {"success": False, "error": ex.error or "Помилка підключення"}
+        return {"success": False, "error": ex.error or "Connection failed"}
     ok, result = await ex.test_connection()
     if not ok:
         return {"success": False, "error": str(result)}
-    wallets[req.user_id] = {"exchange": req.exchange, "balance": float(result),
-                             "testnet": req.testnet, "connected": True, "client": ex}
+    wallets[req.user_id] = {
+        "exchange": req.exchange, "balance": float(result),
+        "testnet": req.testnet, "connected": True, "client": ex,
+    }
     return {"success": True, "balance": float(result), "exchange": req.exchange}
 
 @app.get("/api/wallet/{user_id}")
@@ -1098,25 +1117,28 @@ async def control_agent(req: AgentReq):
     w  = wallets.get(req.user_id)
     ex = w["client"] if w and "client" in w else None
     if req.action == "start":
-        if agent.running: return {"success": False, "msg": "Агент вже запущений"}
-        if not ex: return {"success": False, "msg": "Підключіть API ключі"}
+        if agent.running: return {"success": False, "msg": "Already running"}
+        if not ex:        return {"success": False, "msg": "Connect API keys first"}
         agent.configure(ex, req.risk_pct, req.min_conf, req.max_open)
         asyncio.create_task(agent.start())
-        return {"success": True, "msg": "Агент запущений"}
+        return {"success": True, "msg": "Agent started"}
     elif req.action == "stop":
-        agent.stop(); return {"success": True, "msg": "Агент зупинений"}
+        agent.stop()
+        return {"success": True, "msg": "Agent stopped"}
     elif req.action == "status":
         return agent.stats()
     return {"success": False}
 
 @app.post("/api/trade")
 async def manual_trade(req: TradeReq):
-    w = wallets.get(req.user_id)
+    w  = wallets.get(req.user_id)
     ex = w["client"] if w and "client" in w else None
-    if not ex: return {"success": False, "error": "Підключіть API"}
-    sig = cache.get(req.symbol.upper(), {})
-    order = await ex.place_order(req.symbol.upper(), req.side, req.amount,
-                                  req.leverage, sig.get("tp", 0), sig.get("sl", 0))
+    if not ex: return {"success": False, "error": "Connect API keys"}
+    sig   = cache.get(req.symbol.upper(), {})
+    order = await ex.place_order(
+        req.symbol.upper(), req.side, req.amount,
+        req.leverage, sig.get("tp", 0), sig.get("sl", 0)
+    )
     if "error" in order: return {"success": False, "error": order["error"]}
     manual_trades.append({**order, "ts": time.time()})
     return {"success": True, "trade": order}
